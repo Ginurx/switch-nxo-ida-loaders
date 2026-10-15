@@ -690,9 +690,13 @@ else:
             elif r_type == R_ARM_RELATIVE:
                 idaapi.put_dword(target, idaapi.get_dword(target) + loadbase)
             elif r_type in (R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_ABS64):
-                idaapi.put_qword(target, sym.resolved + addend)
-                if addend == 0:
-                    got_name_lookup[offset] = sym.name
+                if sym is None:
+                    # r_sym == 0: no symbol attached, behave like R_AARCH64_RELATIVE
+                    idaapi.put_qword(target, loadbase + addend)
+                else:
+                    idaapi.put_qword(target, sym.resolved + addend)
+                    if addend == 0:
+                        got_name_lookup[offset] = sym.name
             elif r_type == R_AARCH64_RELATIVE:
                 idaapi.put_qword(target, loadbase + addend)
                 if addend < f.textsize:
