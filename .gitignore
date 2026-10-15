@@ -1,1 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / agent tooling
+.vscode/
+.zcode/
+
+# Local files
+tmp/
+AGENTS.local.md
+
+# macOS
 .DS_Store
+
+# IDA databases
+*.idb
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
