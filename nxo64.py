@@ -616,7 +616,7 @@ else:
 
         f.binfile.seek(0)
         as_string = f.binfile.read(f.bssoff)
-        idaapi.mem2base(as_string, loadbase)
+        idaapi.mem2base(as_string, loadbase, -1)
         if f.text[1] != None:
             li.file2base(f.text[1], loadbase + f.text[2], loadbase + f.text[2] + f.text[3], True)
         if f.ro[1] != None:
