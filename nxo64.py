@@ -503,8 +503,8 @@ class NroFile(NxoFileBase):
         tloc, tsize = f.read('II')
         rloc, rsize = f.read('II')
         dloc, dsize = f.read('II')
-        bsssize = f.read_from('I', 0x28)
-        
+        bsssize = f.read_from('I', 0x38)
+
         text = (f.read_from(tsize, tloc), tloc, tloc, tsize)
         ro   = (f.read_from(rsize, rloc), rloc, rloc, rsize)
         data = (f.read_from(dsize, dloc), dloc, dloc, dsize)
