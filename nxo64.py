@@ -418,7 +418,8 @@ class NxoFileBase(object):
                         target = paddr + poff
                         if plt_got_start <= target < plt_got_end:
                             self.plt_entries.append((off, target))
-                builder.add_section('.plt', min(self.plt_entries)[0], end=max(self.plt_entries)[0] + 0x10)
+                if self.plt_entries:
+                    builder.add_section('.plt', min(self.plt_entries)[0], end=max(self.plt_entries)[0] + 0x10)
 
             # try to find the ".got" which should follow the ".got.plt"
             if not self.isLibnx:
