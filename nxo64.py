@@ -132,6 +132,13 @@ DT_FLAGS_1 = 0x6ffffffb
 DT_VERDEF = 0x6ffffffc
 DT_VERDEFNUM = 0x6ffffffd
 
+# DT_RELRSZ / DT_RELR / DT_RELRENT (35/36/37): gABI "compact relative
+# relocations". 17.0.1+ firmware NSOs are static PIE with no DT_RELA at all;
+# every R_AARCH64_RELATIVE fixup is packed into this bitmap table instead.
+DT_RELRSZ = 35
+DT_RELR = 36
+DT_RELRENT = 37
+
 STT_NOTYPE = 0
 STT_OBJECT = 1
 STT_FUNC = 2
@@ -355,6 +362,7 @@ class NxoFileBase(object):
             (DT_INIT_ARRAY, DT_INIT_ARRAYSZ, '.init_array'),
             (DT_FINI_ARRAY, DT_FINI_ARRAYSZ, '.fini_array'),
             (DT_RELA, DT_RELASZ, '.rela.dyn'),
+            (DT_RELR, DT_RELRSZ, '.relr.dyn'),
             (DT_REL, DT_RELSZ, '.rel.dyn'),
             (DT_JMPREL, DT_PLTRELSZ, ('.rel.plt' if self.armv7 else '.rela.plt')),
         ]:
@@ -388,6 +396,43 @@ class NxoFileBase(object):
 
         if DT_RELA in dynamic and DT_RELASZ in dynamic:
             locations |= self.process_relocations(f, symbols, dynamic[DT_RELA], dynamic[DT_RELASZ])
+
+        # Compact relative relocations (DT_RELR, gABI). 17.0.1+ firmware modules
+        # ship no DT_RELA: every R_AARCH64_RELATIVE fixup is packed into a u64
+        # bitmap table in .rodata instead:
+        #   even word (bit0 = 0): address entry -- relocate the qword at that
+        #     module-relative address, then where = entry + 8
+        #   odd word (bit0 = 1): bitmap entry -- bit i (i = 0..62, bit0 is the
+        #     tag) relocates where + 8*i; afterwards where += 63*8, so chained
+        #     bitmaps keep walking forward through .data
+        # Entries carry no addend field: the link-time value already stored at
+        # the target is the implicit addend (runtime semantic: *target += base).
+        # Expand each target into a regular R_AARCH64_RELATIVE entry so the
+        # existing apply loop fixes the value, marks .text targets as functions
+        # and turns them into offsets/xrefs. read_from() restores the file
+        # position, so it does not disturb the sequential walk of the table.
+        if DT_RELR in dynamic and DT_RELRSZ in dynamic:
+            if self.armv7:
+                print('warning: ignoring DT_RELR in armv7 module')
+            elif DT_RELRENT in dynamic and dynamic[DT_RELRENT] != 8:
+                print('warning: ignoring DT_RELR with entsize != 8')
+            else:
+                where = 0
+                f.seek(dynamic[DT_RELR])
+                for i in iter_range(dynamic[DT_RELRSZ] // 8):
+                    entry = f.read('Q')
+                    if (entry & 1) == 0:
+                        self.relocations.append((entry, R_AARCH64_RELATIVE, None, f.read_from('Q', entry)))
+                        where = entry + 8
+                    elif where:
+                        for j in iter_range(63):
+                            if entry & (2 << j):
+                                target = where + j * 8
+                                self.relocations.append((target, R_AARCH64_RELATIVE, None, f.read_from('Q', target)))
+                        where += 63 * 8
+                    else:
+                        print('warning: DT_RELR bitmap entry before any address entry')
+                        break
 
         if DT_JMPREL in dynamic and DT_PLTRELSZ in dynamic:
             pltlocations = self.process_relocations(f, symbols, dynamic[DT_JMPREL], dynamic[DT_PLTRELSZ])
