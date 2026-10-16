@@ -39,18 +39,23 @@ else:
 
 def kip1_blz_decompress(compressed):
     compressed_size, init_index, uncompressed_addl_size = struct.unpack('<III', compressed[-0xC:])
+    # BLZ allows "partial compression": the first len - compressed_size bytes
+    # are stored raw and the stream only encodes the rest, so decoding must
+    # stop at that prefix boundary, not at offset 0 (17.0.1 spl.kip1 .text
+    # carries a 21-byte raw prefix; decoding past it exhausts the stream).
+    prefix_len = len(compressed) - compressed_size
     decompressed = compressed[:] + b'\x00' * uncompressed_addl_size
     decompressed_size = len(decompressed)
     if len(compressed) != compressed_size:
         assert len(compressed) > compressed_size
-        compressed = compressed[len(compressed) - compressed_size:]
+        compressed = compressed[prefix_len:]
     if not (compressed_size + uncompressed_addl_size):
         return b''
     compressed = bytes_to_list(compressed)
     decompressed = bytes_to_list(decompressed)
     index = compressed_size - init_index
     outindex = decompressed_size
-    while outindex > 0:
+    while outindex > prefix_len:
         index -= 1
         control = compressed[index]
         for i in iter_range(8):
@@ -62,8 +67,11 @@ def kip1_blz_decompress(compressed):
                 segmentsize = ((segmentoffset >> 12) & 0xF) + 3
                 segmentoffset &= 0x0FFF
                 segmentoffset += 2
-                if outindex < segmentsize:
-                    raise ValueError('Compression out of bounds!')
+                # the match size field bottoms out at 3, so a match may claim
+                # more bytes than remain to fill; clamp like LibHac's
+                # KipReader.DecompressBlz instead of treating it as corruption
+                if segmentsize > outindex - prefix_len:
+                    segmentsize = outindex - prefix_len
                 for j in iter_range(segmentsize):
                     if outindex + segmentoffset >= decompressed_size:
                         raise ValueError('Compression out of bounds!')
@@ -78,7 +86,7 @@ def kip1_blz_decompress(compressed):
                 decompressed[outindex] = compressed[index]
             control <<= 1
             control &= 0xFF
-            if not outindex:
+            if outindex <= prefix_len:
                 break
     return list_to_bytes(decompressed)
 
