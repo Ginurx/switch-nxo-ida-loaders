@@ -606,6 +606,8 @@ def load_nxo(fileobj):
 try:
     import idaapi
     import idc
+    import ida_loader
+    import ida_netnode
 except ImportError:
     pass
 else:
@@ -687,7 +689,6 @@ else:
             idaapi.set_segm_addressing(segm, 1 if f.armv7 else 2)
 
         # do imports
-        # TODO: can we make imports show up in "Imports" window?
         undef_count = 0
         for s in f.symbols:
             if not s.shndx and s.name:
@@ -725,7 +726,11 @@ else:
                 if s.type == STT_FUNC:
                     funcs.add(loadbase+s.value)
 
+        # imports: (ea, name) pairs gathered while applying relocations --
+        # only undefined dynamic symbols actually referenced by a symbolic
+        # relocation are real imports (see the loop below)
         got_name_lookup = {}
+        imports = []
         for offset, r_type, sym, addend in f.relocations:
             target = offset + loadbase
             if r_type in (R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_ABS32):
@@ -733,6 +738,8 @@ else:
                     print('error: relocation at %X failed' % target)
                 else:
                     idaapi.put_dword(target, sym.resolved)
+                    if not sym.shndx and sym.name:
+                        imports.append((target, sym.name))
             elif r_type == R_ARM_RELATIVE:
                 idaapi.put_dword(target, idaapi.get_dword(target) + loadbase)
             elif r_type in (R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_ABS64):
@@ -741,6 +748,8 @@ else:
                     idaapi.put_qword(target, loadbase + addend)
                 else:
                     idaapi.put_qword(target, sym.resolved + addend)
+                    if not sym.shndx and sym.name:
+                        imports.append((target, sym.name))
                     if addend == 0:
                         got_name_lookup[offset] = sym.name
             elif r_type == R_AARCH64_RELATIVE:
@@ -750,6 +759,29 @@ else:
             else:
                 print('TODO r_type %d' % (r_type,))
             ida_make_offset(f, target)
+
+        # Register imported (undefined) symbols so they show up in IDA's
+        # "Imports" window, the way native file loaders do (PE/COFF register
+        # their IAT slots).  Each entry's ea is the GOT/data slot the
+        # relocation patched -- double-clicking it in the window jumps there.
+        # ELF records no symbol-to-library mapping: at runtime rtld/ld.so
+        # just searches the DT_NEEDED modules in order, so attribute all
+        # imports to the first needed module (placeholder name if none).
+        # API contract: fill a fresh netnode with set_import_name() entries,
+        # then import_module() attaches it under the library name.
+        if imports:
+            modnode = ida_netnode.netnode()
+            modnode.create()
+            modidx = modnode.index()
+            for ea, name in imports:
+                ida_loader.set_import_name(modidx, ea, name)
+            modname = f.needed[0] if f.needed else 'unknown'
+            # NintendoSDK links write full build-host paths into DT_NEEDED
+            # (e.g. BotW: "D:/home/Cafe/U-King/.../nnSdk.nss"); rtld identifies
+            # modules by basename, so show that when one is present.
+            modname = modname.rsplit('/', 1)[-1].rsplit('\\', 1)[-1] or modname
+            ida_loader.import_module(modname, None, modidx, None, None)
+            print('%d imports from %s' % (len(imports), modname))
 
         for func, target in f.plt_entries:
             if target in got_name_lookup:
