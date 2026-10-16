@@ -292,6 +292,15 @@ class NxoFileBase(object):
     # absent (game mains/subsdkX and homebrew NROs typically carry none).
     soname = None
 
+    # KIP1-only header identity/scheduling fields (offsets per LibHac
+    # KipHeader.cs), set by KipFile before super().__init__().
+    kip_name = None
+    kip_program_id = None
+    kip_version = None
+    kip_priority = None
+    kip_core = None
+    kip_stack_size = None
+
     # segment = (content, file offset, vaddr, vsize)
     def __init__(self, text, ro, data, bsssize):
         self.text = text
@@ -609,6 +618,14 @@ class KipFile(NxoFileBase):
         if f.read_from('4s', 0) != b'KIP1':
             raise NxoException('Invalid KIP magic')
 
+        # identity / scheduling fields (KipHeader.cs: Name@0x04 is 12 bytes,
+        # so longer names arrive truncated, e.g. "ProcessMana")
+        self.kip_name = f.read_from('12s', 0x4).split(b'\x00', 1)[0].decode('ascii', 'replace')
+        self.kip_program_id = f.read_from('Q', 0x10)
+        self.kip_version = f.read_from('i', 0x18)
+        self.kip_priority = f.read_from('b', 0x1C)
+        self.kip_core = f.read_from('b', 0x1D)
+
         flags = f.read_from('b', 0x1F)
             
         tloc, tsize, tfilesize = f.read_from('III', 0x20)
@@ -620,6 +637,7 @@ class KipFile(NxoFileBase):
         doff = roff + rfilesize
 
         bsssize = f.read_from('I', 0x54)
+        self.kip_stack_size = f.read_from('I', 0x3C)
         print('bss size 0x%x' % bsssize)
 
         print('load segments')
@@ -868,7 +886,10 @@ else:
         # symbol tables and cheat/mod files key on this value (yuzu matches
         # mods by the full 64-hex id, cheats by its first 16 chars); the
         # SONAME is the rtld-visible module name DT_NEEDED entries resolve
-        # against.  A *repeatable* comment at loadbase does not survive
+        # against; for KIPs the header identity/scheduling summary joins the
+        # SONAME (17.0.1 KIPs do carry one, e.g. "fs.nss"; they have no
+        # Build ID field and no DT_NEEDED -- fully self-contained modules).
+        # A *repeatable* comment at loadbase does not survive
         # initial auto-analysis (measured on IDA 9.4); the regular comment
         # and the segment comment do -- and both are wholesale replacements,
         # so every identity line is collected and written once.
@@ -880,6 +901,12 @@ else:
         if f.soname:
             print('SONAME: %s' % f.soname)
             idlines.append('SONAME: %s' % f.soname)
+        if f.kip_name:
+            kipline = 'KIP: %s (program id %016x, version %d, priority %d, core %d, stack 0x%x)' % (
+                f.kip_name, f.kip_program_id, f.kip_version, f.kip_priority,
+                f.kip_core, f.kip_stack_size)
+            print(kipline)
+            idlines.append(kipline)
         if idlines:
             cmt = '\n'.join(idlines)
             idc.set_cmt(loadbase, cmt, 0)
