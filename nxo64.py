@@ -148,6 +148,11 @@ STB_LOCAL = 0
 STB_GLOBAL = 1
 STB_WEAK = 2
 
+STV_DEFAULT = 0
+STV_INTERNAL = 1
+STV_HIDDEN = 2
+STV_PROTECTED = 3
+
 R_ARM_ABS32 = 2
 R_ARM_TLS_DESC = 13
 R_ARM_GLOB_DAT = 21
@@ -700,6 +705,14 @@ else:
         segm = idaapi.get_segm_by_name("UNDEF")
         segm.type = idaapi.SEG_XTRN
         idaapi.update_segm(segm)
+        # Defined dynamic symbols are the module's exports: ELF has no
+        # separate export table, the defined (shndx != 0) .dynsym entries
+        # ARE it.  Register FUNC and OBJECT symbols as entry points (IDA's
+        # "Exports" window), the way PE loaders register their export
+        # directory, which lists data exports too; other symbol types and
+        # non-export visibilities (STV_INTERNAL/STV_HIDDEN) only get a name.
+        objects = aliases = 0
+        entry_eas = set()
         for i,s in enumerate(f.symbols):
             if not s.shndx and s.name:
                 idaapi.create_data(undef_ea, idc.FF_QWORD, 8, idaapi.BADADDR)
@@ -707,18 +720,32 @@ else:
                 s.resolved = undef_ea
                 undef_ea += undef_entry_size
             elif i != 0:
-                assert s.shndx
-                s.resolved = loadbase + s.value
-                if s.name:
-                    if s.type == STT_FUNC:
-                        print(hex(s.resolved), s.name)
-                        idaapi.add_entry(s.resolved, s.resolved, s.name, 0)
-                    else:
-                        idaapi.force_name(s.resolved, s.name)
-
+                if not s.shndx:
+                    # unnamed UNDEF slot (never seen in the wild); the old
+                    # code asserted here
+                    s.resolved = idaapi.BADADDR
+                else:
+                    s.resolved = loadbase + s.value
+                    # SHN_ABS/SHN_COMMON/... (>= 0xff00): st_value is not a
+                    # section offset, so resolved is bogus -- don't name it
+                    if s.shndx < 0xff00 and s.name:
+                        if s.type in (STT_FUNC, STT_OBJECT) and s.vis not in (STV_INTERNAL, STV_HIDDEN):
+                            # same-address aliases (C1/C2 folding, ICF): IDA
+                            # keeps a single entry per address; aliases just
+                            # counts the folded names
+                            if s.resolved in entry_eas:
+                                aliases += 1
+                            entry_eas.add(s.resolved)
+                            if s.type == STT_OBJECT:
+                                objects += 1
+                            idaapi.add_entry(s.resolved, s.resolved, s.name, 0)
+                        else:
+                            idaapi.force_name(s.resolved, s.name)
             else:
                 # NULL symbol
                 s.resolved = 0
+        if entry_eas:
+            print('%d exports (%d objects, %d aliases)' % (len(entry_eas), objects, aliases))
 
         funcs = set()
         for s in f.symbols:
