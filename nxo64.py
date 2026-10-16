@@ -274,6 +274,11 @@ class ElfSym(object):
 
 
 class NxoFileBase(object):
+    # 32-byte header module id (the "Build ID" emulators match mods and
+    # cheats against); overridden by NsoFile/NroFile, absent from KIP1.
+    # Class-level default so subclass __init__ order doesn't matter.
+    module_id = None
+
     # segment = (content, file offset, vaddr, vsize)
     def __init__(self, text, ro, data, bsssize):
         self.text = text
@@ -526,6 +531,7 @@ class NsoFile(NxoFileBase):
             raise NxoException('Invalid NSO magic')
 
         flags = f.read_from('I', 0xC)
+        self.module_id = f.read_from('32s', 0x40)
 
         toff, tloc, tsize = f.read_from('III', 0x10)
         roff, rloc, rsize = f.read_from('III', 0x20)
@@ -555,6 +561,7 @@ class NroFile(NxoFileBase):
         rloc, rsize = f.read('II')
         dloc, dsize = f.read('II')
         bsssize = f.read_from('I', 0x38)
+        self.module_id = f.read_from('32s', 0x40)
 
         text = (f.read_from(tsize, tloc), tloc, tloc, tsize)
         ro   = (f.read_from(rsize, rloc), rloc, rloc, rsize)
@@ -821,5 +828,18 @@ else:
         for addr in sorted(funcs, reverse=True):
             idc.AutoMark(addr, idc.AU_CODE)
             idc.AutoMark(addr, idc.AU_PROC)
+
+        # Record the module id (Build ID) where the user will find it: the
+        # Output window during load, a comment on the module's first byte
+        # and one on its first segment.  Community symbol tables and
+        # cheat/mod files key on this value (yuzu matches mods by the full
+        # 64-hex id, cheats by its first 16 chars).  A *repeatable* comment
+        # at loadbase does not survive initial auto-analysis (measured on
+        # IDA 9.4); the regular comment and the segment comment do.
+        if f.module_id:
+            build_id = ''.join('%02x' % c for c in bytes_to_list(f.module_id))
+            print('Build ID: %s' % build_id)
+            idc.set_cmt(loadbase, 'Build ID: %s' % build_id, 0)
+            idaapi.set_segment_cmt(idaapi.getseg(loadbase), 'Build ID: %s' % build_id, 1)
 
         return 1
