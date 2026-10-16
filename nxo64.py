@@ -387,7 +387,7 @@ class NxoFileBase(object):
                     st_name, st_value, st_size, st_info, st_other, st_shndx = f.read('IIIBBH')
                 else:
                     st_name, st_info, st_other, st_shndx, st_value, st_size = f.read('IBBHQQ')
-                if st_name > len(self.dynstr):
+                if st_name >= len(self.dynstr):
                     break
                 symbols.append(ElfSym(self.get_dynstr(st_name), st_info, st_other, st_shndx, st_value, st_size))
             builder.add_section('.dynsym', dynamic[DT_SYMTAB], end=f.tell())
