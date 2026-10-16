@@ -15,7 +15,7 @@
 
 from __future__ import print_function
 
-import gzip, math, os, re, struct, sys
+import gzip, hashlib, math, os, re, struct, sys
 from struct import unpack as up, pack as pk
 
 from io import BytesIO
@@ -544,6 +544,21 @@ class NsoFile(NxoFileBase):
         text = (uncompress(f.read_from(tfilesize, toff), uncompressed_size=tsize), None, tloc, tsize) if flags & 1 else (f.read_from(tsize, toff), toff, tloc, tsize)
         ro   = (uncompress(f.read_from(rfilesize, roff), uncompressed_size=rsize), None, rloc, rsize) if flags & 2 else (f.read_from(rsize, roff), roff, rloc, rsize)
         data = (uncompress(f.read_from(dfilesize, doff), uncompressed_size=dsize), None, dloc, dsize) if flags & 4 else (f.read_from(dsize, doff), doff, dloc, dsize)
+
+        # Segment SHA-256 sanity check: flags bits 3/4/5 (one per segment)
+        # mark the 32-byte hashes at 0xA0/0xC0/0xE0 as meaningful, and they
+        # cover the *decompressed* bytes (same semantics as LibHac's
+        # NsoReader).  Warn on mismatch but keep loading -- a partially
+        # corrupt module is often still worth analyzing.
+        for seg, name, bit, hoff in ((text, '.text', 8, 0xA0), (ro, '.ro', 16, 0xC0), (data, '.data', 32, 0xE0)):
+            if flags & bit:
+                want = f.read_from('32s', hoff)
+                got = hashlib.sha256(seg[0]).digest()
+                if got != want:
+                    print('warning: %s sha256 mismatch (header %s, actual %s)'
+                          % (name,
+                             ''.join('%02x' % c for c in bytes_to_list(want)),
+                             ''.join('%02x' % c for c in bytes_to_list(got))))
 
         super(NsoFile, self).__init__(text, ro, data, bsssize)
 
