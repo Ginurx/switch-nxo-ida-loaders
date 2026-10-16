@@ -279,6 +279,11 @@ class NxoFileBase(object):
     # Class-level default so subclass __init__ order doesn't matter.
     module_id = None
 
+    # DT_SONAME from .dynamic: the module's own rtld-visible name (e.g.
+    # firmware hid -> "hid.nss").  Parsed in __init__; None when the tag is
+    # absent (game mains/subsdkX and homebrew NROs typically carry none).
+    soname = None
+
     # segment = (content, file offset, vaddr, vsize)
     def __init__(self, text, ro, data, bsssize):
         self.text = text
@@ -380,6 +385,11 @@ class NxoFileBase(object):
                 builder.add_section(name, dynamic[startkey], size=dynamic[szkey])
 
         self.needed = [self.get_dynstr(i) for i in self.dynamic[DT_NEEDED]]
+
+        # DT_SONAME (single-entry tag): offset into .dynstr naming this
+        # module itself -- the name other modules' DT_NEEDED entries
+        # resolve against.
+        self.soname = self.get_dynstr(self.dynamic[DT_SONAME]) if DT_SONAME in self.dynamic else None
 
         # load .dynsym
         self.symbols = symbols = []
@@ -844,17 +854,27 @@ else:
             idc.AutoMark(addr, idc.AU_CODE)
             idc.AutoMark(addr, idc.AU_PROC)
 
-        # Record the module id (Build ID) where the user will find it: the
-        # Output window during load, a comment on the module's first byte
-        # and one on its first segment.  Community symbol tables and
-        # cheat/mod files key on this value (yuzu matches mods by the full
-        # 64-hex id, cheats by its first 16 chars).  A *repeatable* comment
-        # at loadbase does not survive initial auto-analysis (measured on
-        # IDA 9.4); the regular comment and the segment comment do.
+        # Record module identity where the user will find it: the Output
+        # window during load, a comment on the module's first byte and one
+        # on its first segment.  For the module id (Build ID): community
+        # symbol tables and cheat/mod files key on this value (yuzu matches
+        # mods by the full 64-hex id, cheats by its first 16 chars); the
+        # SONAME is the rtld-visible module name DT_NEEDED entries resolve
+        # against.  A *repeatable* comment at loadbase does not survive
+        # initial auto-analysis (measured on IDA 9.4); the regular comment
+        # and the segment comment do -- and both are wholesale replacements,
+        # so every identity line is collected and written once.
+        idlines = []
         if f.module_id:
             build_id = ''.join('%02x' % c for c in bytes_to_list(f.module_id))
             print('Build ID: %s' % build_id)
-            idc.set_cmt(loadbase, 'Build ID: %s' % build_id, 0)
-            idaapi.set_segment_cmt(idaapi.getseg(loadbase), 'Build ID: %s' % build_id, 1)
+            idlines.append('Build ID: %s' % build_id)
+        if f.soname:
+            print('SONAME: %s' % f.soname)
+            idlines.append('SONAME: %s' % f.soname)
+        if idlines:
+            cmt = '\n'.join(idlines)
+            idc.set_cmt(loadbase, cmt, 0)
+            idaapi.set_segment_cmt(idaapi.getseg(loadbase), cmt, 1)
 
         return 1
