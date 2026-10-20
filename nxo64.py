@@ -301,6 +301,20 @@ class NxoFileBase(object):
     kip_core = None
     kip_stack_size = None
 
+    # nnSdk ModuleVersion triplet (major, minor, micro) behind the rocrt
+    # pointer at image start +8; set by __init__ itself.  None on older
+    # SDKs (BotW-era games) which carry their SDK identity in the
+    # .api_info strings instead.
+    sdk_version = None
+    sdk_offset = None
+
+    # .api_info extent (module-relative offset, size), read from the
+    # format header (NSO 0x88 / NRO 0x68, rodata-relative as produced) by
+    # NsoFile/NroFile before super().__init__().  None when the producer
+    # left it empty (17.x firmware and homebrew NROs).
+    api_info = None
+    api_components = None
+
     # segment = (content, file offset, vaddr, vsize)
     def __init__(self, text, ro, data, bsssize):
         self.text = text
@@ -354,6 +368,22 @@ class NxoFileBase(object):
             self.libnx_got_start    = self.modoff + f.read('i')
             self.libnx_got_end      = self.modoff + f.read('i')
 
+        # rocrt places a branch at the image start, then two pointers: +4 is
+        # the ModuleHeader/MOD0 offset consumed above, +8 points at the
+        # 12-byte nnSdk ModuleVersion (major, minor, micro; on 17.0.0+ it
+        # sits right after the ModuleHeader -- the pointer stays
+        # authoritative).  Older SDKs emit neither branch nor pointer (their
+        # SDK identity is the .api_info string table parsed below), so guard
+        # on the branch opcode and sanity-check the triplet like nso2elf.
+        entry = f.read_from('I', 0)
+        if entry == 1 or (entry >> 26) == 5:
+            sdkoff = f.read_from('i', 8)
+            if 0 < sdkoff < flatsize - 12:
+                major, minor, micro = f.read_from('III', sdkoff)
+                if 0 < major < 1000 and 0 <= minor < 1000 and 0 <= micro < 1000:
+                    self.sdk_version = (major, minor, micro)
+                    self.sdk_offset = sdkoff
+
         self.segment_builder = builder = SegmentBuilder()
         for off,sz,name,kind in [
             (self.textoff, self.textsize, ".text", "CODE"),
@@ -400,6 +430,19 @@ class NxoFileBase(object):
         ]:
             if startkey in dynamic and szkey in dynamic:
                 builder.add_section(name, dynamic[startkey], size=dynamic[szkey])
+
+        # rocrt/SDK metadata sections: the module header this loader itself
+        # consumes (0x1C covers every field read on pre-19.0 layouts), the
+        # nnSdk version triplet behind the +8 pointer, and the .api_info
+        # extent -- older SDKs fill it with NUL-terminated component
+        # descriptors like "SDK MW+Nintendo+NintendoWare_G3d-4_4_0-Release".
+        builder.add_section('.mod0', self.modoff, size=0x1C)
+        if self.sdk_offset is not None:
+            builder.add_section('.nnsdk', self.sdk_offset, size=12)
+        if self.api_info:
+            api_off, api_size = self.api_info
+            builder.add_section('.api_info', api_off, size=api_size)
+            self.api_components = [ascii_string(s) for s in f.read_from('%ds' % api_size, api_off).split(b'\x00') if s]
 
         self.needed = [self.get_dynstr(i) for i in self.dynamic[DT_NEEDED]]
 
@@ -567,6 +610,12 @@ class NsoFile(NxoFileBase):
         tfilesize, rfilesize, dfilesize = f.read_from('III', 0x60)
         bsssize = f.read_from('I', 0x3C)
 
+        # .api_info extent at 0x88 (LibHac ApiInfoOffset/Size, switchbrew
+        # EmbeddedOffset/Size), relative to .rodata: populated by older
+        # SDKs, zeroed on 17.x firmware.
+        api_off, api_size = f.read_from('II', 0x88)
+        self.api_info = (rloc + api_off, api_size) if api_size else None
+
         print('load text: ')
         text = (uncompress(f.read_from(tfilesize, toff), uncompressed_size=tsize), None, tloc, tsize) if flags & 1 else (f.read_from(tsize, toff), toff, tloc, tsize)
         ro   = (uncompress(f.read_from(rfilesize, roff), uncompressed_size=rsize), None, rloc, rsize) if flags & 2 else (f.read_from(rsize, roff), roff, rloc, rsize)
@@ -604,6 +653,12 @@ class NroFile(NxoFileBase):
         dloc, dsize = f.read('II')
         bsssize = f.read_from('I', 0x38)
         self.module_id = f.read_from('32s', 0x40)
+
+        # .api_info extent at 0x68, the NRO counterpart of the NSO 0x88
+        # pair (rodata-relative).  nnSdk-built NROs only; libnx leaves it
+        # zero, so homebrew never carves the section.
+        emb_off, emb_size = f.read_from('II', 0x68)
+        self.api_info = (rloc + emb_off, emb_size) if emb_size else None
 
         text = (f.read_from(tsize, tloc), tloc, tloc, tsize)
         ro   = (f.read_from(rsize, rloc), rloc, rloc, rsize)
@@ -886,12 +941,15 @@ else:
         # symbol tables and cheat/mod files key on this value (yuzu matches
         # mods by the full 64-hex id, cheats by its first 16 chars); the
         # SONAME is the rtld-visible module name DT_NEEDED entries resolve
-        # against; the NEEDED line lists the DT_NEEDED dependencies; for
-        # KIPs the header identity/scheduling summary joins the SONAME
-        # (17.0.1 KIPs do carry one, e.g. "fs.nss"; they have no Build ID
-        # field and no DT_NEEDED -- fully self-contained modules).  The
-        # Segments line summarizes the four-segment memory footprint,
-        # including the .bss range which has no backing in the file.
+        # against; the NEEDED line lists the DT_NEEDED dependencies; the SDK
+        # line names the nnSdk the module was built against (ModuleVersion
+        # triplet behind the rocrt +8 pointer on 17.x, the .api_info
+        # component strings on older SDKs); for KIPs the header
+        # identity/scheduling summary joins the SONAME (17.0.1 KIPs do carry
+        # one, e.g. "fs.nss"; they have no Build ID field and no DT_NEEDED
+        # -- fully self-contained modules).  The Segments line summarizes
+        # the four-segment memory footprint, including the .bss range which
+        # has no backing in the file.
         # A *repeatable* comment at loadbase does not survive
         # initial auto-analysis (measured on IDA 9.4); the regular comment
         # and the segment comment do -- and both are wholesale replacements,
@@ -912,6 +970,24 @@ else:
             names = [n.rsplit('/', 1)[-1].rsplit('\\', 1)[-1] or n for n in f.needed]
             print('NEEDED: %s' % ', '.join(names))
             idlines.append('NEEDED: %s' % ', '.join(names))
+        sdkline = None
+        if f.sdk_version:
+            sdkline = 'SDK: nnSdk %d.%d.%d' % f.sdk_version
+        elif f.api_components:
+            # older SDKs list every linked component, middleware included:
+            # "SDK MW+Nintendo+NintendoWare_G3d-4_4_0-Release",
+            # "SDK MW+Microsoft+Havok-2014_2", "SDK MW+Nintendo+NEX-4_2_1-ALZ".
+            # The NintendoSDK version is the first Nintendo -Release entry.
+            for c in f.api_components:
+                m = re.match(r'SDK MW\+Nintendo\+\S+-(\d+)_(\d+)_(\d+)-Release$', c)
+                if m:
+                    sdkline = 'SDK: NintendoSDK %s.%s.%s (%d component%s)' % (
+                        m.group(1), m.group(2), m.group(3),
+                        len(f.api_components), '' if len(f.api_components) == 1 else 's')
+                    break
+        if sdkline:
+            print(sdkline)
+            idlines.append(sdkline)
         if f.kip_name:
             kipline = 'KIP: %s (program id %016x, version %d, priority %d, core %d, stack 0x%x)' % (
                 f.kip_name, f.kip_program_id, f.kip_version, f.kip_priority,
