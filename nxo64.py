@@ -317,6 +317,16 @@ class NxoFileBase(object):
     api_info = None
     api_components = None
 
+    # Pre-dynamic-linking homebrew NROs (libnx before mid-2018, e.g.
+    # ChoiDujourNX v1.0.1) carry no ModuleHeader at all: NroStart's +4
+    # MOD0-offset field is 0 and the whole rtld layer (.dynamic, .dynsym,
+    # relocations, imports/exports) simply does not exist -- the NRO
+    # header alone describes the image.  When set, NxoFileBase falls back
+    # to header-only loading for such files; for NSO/KIP a missing MOD0
+    # means corruption and stays a hard error.  Set by NroFile before
+    # super().__init__() (same pattern as the kip_* fields).
+    allow_no_mod0 = False
+
     # segment = (content, file offset, vaddr, vsize)
     def __init__(self, text, ro, data, bsssize):
         self.text = text
@@ -349,42 +359,63 @@ class NxoFileBase(object):
         # read MOD
         self.modoff = f.read_from('I', 4)
 
-        f.seek(self.modoff)
-        if f.read('4s') != b'MOD0':
-            raise NxoException('invalid MOD0 magic')
-
-        self.dynamicoff = self.modoff + f.read('i')
-        self.bssoff     = self.modoff + f.read('i')
-        self.bssend     = self.modoff + f.read('i')
-        self.unwindoff  = self.modoff + f.read('i')
-        self.unwindend  = self.modoff + f.read('i')
-        self.moduleoff  = self.modoff + f.read('i')
-
-
-        self.datasize = self.bssoff - self.dataoff
-        self.bsssize = self.bssend - self.bssoff
-
         self.isLibnx = False
-        if f.read('4s') == 'LNY0':
-            self.isLibnx = True
-            self.libnx_got_start    = self.modoff + f.read('i')
-            self.libnx_got_end      = self.modoff + f.read('i')
+        if self.allow_no_mod0 and self.modoff == 0:
+            # Header-only NRO (see allow_no_mod0): segment bounds come
+            # straight from the NRO header -- .data runs to the end of the
+            # declared image and .bss follows it with no gap, which is
+            # exactly what real MOD0 NROs declare (gsl: .data ends at
+            # 0x3ec68 == image end).  bsssize keeps the header value
+            # passed in (0x38, corrected in 3ad2a24 for this case).
+            self.modoff = None
+            self.datasize = data[3]
+            self.bssoff = flatsize
+            self.armv7 = False  # homebrew NROs are aarch64-only
+            self.offsize = 8
+            self.dynamic = dynamic = {i: [] for i in MULTIPLE_DTS}
+            self.dynstr = b'\x00'
+            print('note: no MOD0 header, loading as pre-dynamic-linking homebrew NRO')
+            has_mod0 = False
+        else:
+            f.seek(self.modoff)
+            if f.read('4s') != b'MOD0':
+                raise NxoException('invalid MOD0 magic')
 
-        # rocrt places a branch at the image start, then two pointers: +4 is
-        # the ModuleHeader/MOD0 offset consumed above, +8 points at the
-        # 12-byte nnSdk ModuleVersion (major, minor, micro; on 17.0.0+ it
-        # sits right after the ModuleHeader -- the pointer stays
-        # authoritative).  Older SDKs emit neither branch nor pointer (their
-        # SDK identity is the .api_info string table parsed below), so guard
-        # on the branch opcode and sanity-check the triplet like nso2elf.
-        entry = f.read_from('I', 0)
-        if entry == 1 or (entry >> 26) == 5:
-            sdkoff = f.read_from('i', 8)
-            if 0 < sdkoff < flatsize - 12:
-                major, minor, micro = f.read_from('III', sdkoff)
-                if 0 < major < 1000 and 0 <= minor < 1000 and 0 <= micro < 1000:
-                    self.sdk_version = (major, minor, micro)
-                    self.sdk_offset = sdkoff
+            self.dynamicoff = self.modoff + f.read('i')
+            self.bssoff     = self.modoff + f.read('i')
+            self.bssend     = self.modoff + f.read('i')
+            self.unwindoff  = self.modoff + f.read('i')
+            self.unwindend  = self.modoff + f.read('i')
+            self.moduleoff  = self.modoff + f.read('i')
+
+
+            self.datasize = self.bssoff - self.dataoff
+            self.bsssize = self.bssend - self.bssoff
+
+            if f.read('4s') == 'LNY0':
+                self.isLibnx = True
+                self.libnx_got_start    = self.modoff + f.read('i')
+                self.libnx_got_end      = self.modoff + f.read('i')
+
+            # rocrt places a branch at the image start, then two pointers:
+            # +4 is the ModuleHeader/MOD0 offset consumed above, +8 points
+            # at the 12-byte nnSdk ModuleVersion (major, minor, micro; on
+            # 17.0.0+ it sits right after the ModuleHeader -- the pointer
+            # stays authoritative).  Older SDKs emit neither branch nor
+            # pointer (their SDK identity is the .api_info string table
+            # parsed below), so guard on the branch opcode and
+            # sanity-check the triplet like nso2elf.  Pre-dynamic
+            # homebrew NROs are never nnSdk and skip this entirely
+            # (ChoiDujourNX's +8 holds the "HOMEBREW" marker).
+            entry = f.read_from('I', 0)
+            if entry == 1 or (entry >> 26) == 5:
+                sdkoff = f.read_from('i', 8)
+                if 0 < sdkoff < flatsize - 12:
+                    major, minor, micro = f.read_from('III', sdkoff)
+                    if 0 < major < 1000 and 0 <= minor < 1000 and 0 <= micro < 1000:
+                        self.sdk_version = (major, minor, micro)
+                        self.sdk_offset = sdkoff
+            has_mod0 = True
 
         self.segment_builder = builder = SegmentBuilder()
         for off,sz,name,kind in [
@@ -396,49 +427,51 @@ class NxoFileBase(object):
             builder.add_segment(off, sz, name, kind)
 
         # read dynamic
-        self.armv7 = (f.read_from('Q', self.dynamicoff) > 0xFFFFFFFF or f.read_from('Q', self.dynamicoff+0x10) > 0xFFFFFFFF)
-        self.offsize = 4 if self.armv7 else 8
+        if has_mod0:
+            self.armv7 = (f.read_from('Q', self.dynamicoff) > 0xFFFFFFFF or f.read_from('Q', self.dynamicoff+0x10) > 0xFFFFFFFF)
+            self.offsize = 4 if self.armv7 else 8
 
-        f.seek(self.dynamicoff)
-        self.dynamic = dynamic = {}
-        for i in MULTIPLE_DTS:
-            dynamic[i] = []
-        for i in iter_range((flatsize - self.dynamicoff) // 0x10):
-            tag, val = f.read('II' if self.armv7 else 'QQ')
-            if tag == DT_NULL:
-                break
-            if tag in MULTIPLE_DTS:
-                dynamic[tag].append(val)
+            f.seek(self.dynamicoff)
+            self.dynamic = dynamic = {}
+            for i in MULTIPLE_DTS:
+                dynamic[i] = []
+            for i in iter_range((flatsize - self.dynamicoff) // 0x10):
+                tag, val = f.read('II' if self.armv7 else 'QQ')
+                if tag == DT_NULL:
+                    break
+                if tag in MULTIPLE_DTS:
+                    dynamic[tag].append(val)
+                else:
+                    dynamic[tag] = val
+            builder.add_section('.dynamic', self.dynamicoff, end=f.tell())
+
+            # read .dynstr
+            if DT_STRTAB in dynamic and DT_STRSZ in dynamic:
+                f.seek(dynamic[DT_STRTAB])
+                self.dynstr = f.read(dynamic[DT_STRSZ])
             else:
-                dynamic[tag] = val
-        builder.add_section('.dynamic', self.dynamicoff, end=f.tell())
+                self.dynstr = b'\x00'
+                print('warning: no dynstr')
 
-        # read .dynstr
-        if DT_STRTAB in dynamic and DT_STRSZ in dynamic:
-            f.seek(dynamic[DT_STRTAB])
-            self.dynstr = f.read(dynamic[DT_STRSZ])
-        else:
-            self.dynstr = b'\x00'
-            print('warning: no dynstr')
-
-        for startkey, szkey, name in [
-            (DT_STRTAB, DT_STRSZ, '.dynstr'),
-            (DT_INIT_ARRAY, DT_INIT_ARRAYSZ, '.init_array'),
-            (DT_FINI_ARRAY, DT_FINI_ARRAYSZ, '.fini_array'),
-            (DT_RELA, DT_RELASZ, '.rela.dyn'),
-            (DT_RELR, DT_RELRSZ, '.relr.dyn'),
-            (DT_REL, DT_RELSZ, '.rel.dyn'),
-            (DT_JMPREL, DT_PLTRELSZ, ('.rel.plt' if self.armv7 else '.rela.plt')),
-        ]:
-            if startkey in dynamic and szkey in dynamic:
-                builder.add_section(name, dynamic[startkey], size=dynamic[szkey])
+            for startkey, szkey, name in [
+                (DT_STRTAB, DT_STRSZ, '.dynstr'),
+                (DT_INIT_ARRAY, DT_INIT_ARRAYSZ, '.init_array'),
+                (DT_FINI_ARRAY, DT_FINI_ARRAYSZ, '.fini_array'),
+                (DT_RELA, DT_RELASZ, '.rela.dyn'),
+                (DT_RELR, DT_RELRSZ, '.relr.dyn'),
+                (DT_REL, DT_RELSZ, '.rel.dyn'),
+                (DT_JMPREL, DT_PLTRELSZ, ('.rel.plt' if self.armv7 else '.rela.plt')),
+            ]:
+                if startkey in dynamic and szkey in dynamic:
+                    builder.add_section(name, dynamic[startkey], size=dynamic[szkey])
 
         # rocrt/SDK metadata sections: the module header this loader itself
         # consumes (0x1C covers every field read on pre-19.0 layouts), the
         # nnSdk version triplet behind the +8 pointer, and the .api_info
         # extent -- older SDKs fill it with NUL-terminated component
         # descriptors like "SDK MW+Nintendo+NintendoWare_G3d-4_4_0-Release".
-        builder.add_section('.mod0', self.modoff, size=0x1C)
+        if has_mod0:
+            builder.add_section('.mod0', self.modoff, size=0x1C)
         if self.sdk_offset is not None:
             builder.add_section('.nnsdk', self.sdk_offset, size=12)
         if self.api_info:
@@ -665,6 +698,10 @@ class NroFile(NxoFileBase):
         text = (f.read_from(tsize, tloc), tloc, tloc, tsize)
         ro   = (f.read_from(rsize, rloc), rloc, rloc, rsize)
         data = (f.read_from(dsize, dloc), dloc, dloc, dsize)
+
+        # pre-dynamic-linking homebrew NROs carry no ModuleHeader; see
+        # allow_no_mod0 in NxoFileBase
+        self.allow_no_mod0 = True
 
         super(NroFile, self).__init__(text, ro, data, bsssize)
 
@@ -1042,7 +1079,10 @@ else:
         # and the segment comment do -- and both are wholesale replacements,
         # so every identity line is collected and written once.
         idlines = []
-        if f.module_id:
+        # an all-zero Build ID means absent (early libnx NROs like
+        # ChoiDujourNX v1.0.1 leave it zeroed) -- print nothing rather
+        # than 64 zeros
+        if f.module_id and any(f.module_id):
             build_id = ''.join('%02x' % c for c in bytes_to_list(f.module_id))
             print('Build ID: %s' % build_id)
             idlines.append('Build ID: %s' % build_id)
