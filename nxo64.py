@@ -886,9 +886,12 @@ else:
         # symbol tables and cheat/mod files key on this value (yuzu matches
         # mods by the full 64-hex id, cheats by its first 16 chars); the
         # SONAME is the rtld-visible module name DT_NEEDED entries resolve
-        # against; for KIPs the header identity/scheduling summary joins the
-        # SONAME (17.0.1 KIPs do carry one, e.g. "fs.nss"; they have no
-        # Build ID field and no DT_NEEDED -- fully self-contained modules).
+        # against; the NEEDED line lists the DT_NEEDED dependencies; for
+        # KIPs the header identity/scheduling summary joins the SONAME
+        # (17.0.1 KIPs do carry one, e.g. "fs.nss"; they have no Build ID
+        # field and no DT_NEEDED -- fully self-contained modules).  The
+        # Segments line summarizes the four-segment memory footprint,
+        # including the .bss range which has no backing in the file.
         # A *repeatable* comment at loadbase does not survive
         # initial auto-analysis (measured on IDA 9.4); the regular comment
         # and the segment comment do -- and both are wholesale replacements,
@@ -901,12 +904,34 @@ else:
         if f.soname:
             print('SONAME: %s' % f.soname)
             idlines.append('SONAME: %s' % f.soname)
+        if f.needed:
+            # rtld matches DT_NEEDED entries by basename (see the import
+            # registration above), so summarize by basename -- the full
+            # NintendoSDK build paths some games write here stay visible
+            # in .dynstr.
+            names = [n.rsplit('/', 1)[-1].rsplit('\\', 1)[-1] or n for n in f.needed]
+            print('NEEDED: %s' % ', '.join(names))
+            idlines.append('NEEDED: %s' % ', '.join(names))
         if f.kip_name:
             kipline = 'KIP: %s (program id %016x, version %d, priority %d, core %d, stack 0x%x)' % (
                 f.kip_name, f.kip_program_id, f.kip_version, f.kip_priority,
                 f.kip_core, f.kip_stack_size)
             print(kipline)
             idlines.append(kipline)
+        segparts = []
+        for name, start, size in (
+            ('.text', f.textoff, f.textsize),
+            ('.rodata', f.rodataoff, f.rodatasize),
+            ('.data', f.dataoff, f.datasize),
+            ('.bss', f.bssoff, f.bsssize),
+        ):
+            if size:
+                segparts.append('%s 0x%x-0x%x' % (name, start, start + size))
+        if segparts:
+            # module-relative ranges; IDA's Segments window shows the
+            # flattened sub-sections, this is the four-container overview
+            print('Segments: %s' % ' | '.join(segparts))
+            idlines.append('Segments: %s' % ' | '.join(segparts))
         if idlines:
             cmt = '\n'.join(idlines)
             idc.set_cmt(loadbase, cmt, 0)
