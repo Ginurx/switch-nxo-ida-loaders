@@ -724,6 +724,7 @@ def load_nxo(fileobj):
 try:
     import idaapi
     import idc
+    import ida_funcs
     import ida_loader
     import ida_netnode
 except ImportError:
@@ -860,11 +861,23 @@ else:
         if entry_eas:
             print('%d exports (%d objects, %d aliases)' % (len(entry_eas), objects, aliases))
 
+        # Defined STT_FUNC symbols are function candidates; the linker also
+        # recorded each one's exact st_size, so keep the size alongside
+        # (when it fits inside .text) and let the application loop below
+        # create the function with real boundaries instead of leaving them
+        # for auto-analysis to guess -- guessed edges are what makes the
+        # decompiler misjudge inlining and truncate at junk instructions.
+        # Same-address aliases (ICF folding) are identical code, so the
+        # first size seen wins.
         funcs = set()
+        sized_funcs = {}
         for s in f.symbols:
             if s.name and s.shndx and s.value:
                 if s.type == STT_FUNC:
-                    funcs.add(loadbase+s.value)
+                    ea = loadbase+s.value
+                    funcs.add(ea)
+                    if s.size and f.textoff <= s.value and s.value + s.size <= f.textoff + f.textsize:
+                        sized_funcs.setdefault(ea, s.size)
 
         # imports: (ea, name) pairs gathered while applying relocations --
         # only undefined dynamic symbols actually referenced by a symbolic
@@ -931,7 +944,20 @@ else:
 
         funcs |= find_bl_targets(loadbase, loadbase+f.textsize)
 
+        # Descending order: when an over-recorded st_size would swallow the
+        # entry of an already-created function, add_func fails and that
+        # address falls back to the old AutoMark path.  add_func also
+        # refuses to start on bytes that are not an instruction yet, and
+        # during load nothing has been decoded, so create the entry
+        # instruction first (without it every add_func call fails and the
+        # pinning is a silent no-op).
         for addr in sorted(funcs, reverse=True):
+            size = sized_funcs.get(addr)
+            if size:
+                if not idaapi.is_code(idaapi.get_flags(addr)):
+                    idaapi.create_insn(addr)
+                if ida_funcs.add_func(addr, addr + size):
+                    continue
             idc.AutoMark(addr, idc.AU_CODE)
             idc.AutoMark(addr, idc.AU_PROC)
 
