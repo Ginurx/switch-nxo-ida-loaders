@@ -913,6 +913,40 @@ else:
                 print('TODO r_type %d' % (r_type,))
             ida_make_offset(f, target)
 
+        # DT_INIT / DT_FINI are plain function addresses recorded in
+        # .dynamic itself (not relocation targets): rtld calls them right
+        # after mapping the module / right before unloading it.  No other
+        # discovery path in this loader finds them -- they are typically
+        # only ever called by rtld, so no in-module BL reaches them either.
+        # Name them only when no dynsym symbol already did (BotW-era
+        # modules export real _init/_fini symbols, firmware modules carry
+        # neither the symbols nor any name).
+        for tag, name in ((DT_INIT, '_init'), (DT_FINI, '_fini')):
+            val = f.dynamic.get(tag, 0)
+            if val and f.textoff <= val < f.textoff + f.textsize:
+                ea = loadbase + val
+                funcs.add(ea)
+                if not idc.get_name(ea):
+                    idaapi.force_name(ea, name)
+
+        # INIT_ARRAY / FINI_ARRAY are pointer tables in .data listing the
+        # remaining init/fini callbacks (C++ ctors/dtors among them).  The
+        # apply loop above has already fixed every entry up to its final
+        # loadbase+target value (both RELA and RELR paths land there), so
+        # read the values back and treat each in-text target as a function
+        # candidate.  The relative-addend rule in the apply loop covers
+        # most of these already; reading the arrays also catches entries
+        # whose relocations use types this loader does not unpack.
+        for tag, szkey in ((DT_INIT_ARRAY, DT_INIT_ARRAYSZ), (DT_FINI_ARRAY, DT_FINI_ARRAYSZ)):
+            arroff, arrsz = f.dynamic.get(tag), f.dynamic.get(szkey)
+            if arroff is None or not arrsz:
+                continue
+            for i in iter_range(arrsz // f.offsize):
+                slot = loadbase + arroff + i*f.offsize
+                val = idaapi.get_qword(slot) if not f.armv7 else idaapi.get_dword(slot)
+                if loadbase + f.textoff <= val < loadbase + f.textoff + f.textsize:
+                    funcs.add(val)
+
         # Register imported (undefined) symbols so they show up in IDA's
         # "Imports" window, the way native file loaders do (PE/COFF register
         # their IAT slots).  Each entry's ea is the GOT/data slot the
