@@ -166,12 +166,14 @@ R_ARM_TLS_DESC = 13
 R_ARM_GLOB_DAT = 21
 R_ARM_JUMP_SLOT = 22
 R_ARM_RELATIVE = 23
+R_ARM_IRELATIVE = 160
 
 R_AARCH64_ABS64 = 257
 R_AARCH64_GLOB_DAT = 1025
 R_AARCH64_JUMP_SLOT = 1026
 R_AARCH64_RELATIVE = 1027
 R_AARCH64_TLSDESC = 1031
+R_AARCH64_IRELATIVE = 1032
 
 MULTIPLE_DTS = set([DT_NEEDED])
 
@@ -895,6 +897,16 @@ else:
                         imports.append((target, sym.name))
             elif r_type == R_ARM_RELATIVE:
                 idaapi.put_dword(target, idaapi.get_dword(target) + loadbase)
+            elif r_type == R_ARM_IRELATIVE:
+                # IFUNC, REL flavour (see the R_AARCH64_IRELATIVE branch
+                # below for the semantics): the implicit addend already
+                # stored in the slot is the resolver's module-relative
+                # address, so the write matches R_ARM_RELATIVE above and
+                # the pre-rebase slot value is the resolver.
+                resolver = idaapi.get_dword(target) + loadbase
+                idaapi.put_dword(target, resolver)
+                if f.textoff <= resolver - loadbase < f.textoff + f.textsize:
+                    funcs.add(resolver)
             elif r_type in (R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_ABS64):
                 if sym is None:
                     # r_sym == 0: no symbol attached, behave like R_AARCH64_RELATIVE
@@ -908,6 +920,21 @@ else:
             elif r_type == R_AARCH64_RELATIVE:
                 idaapi.put_qword(target, loadbase + addend)
                 if addend < f.textsize:
+                    funcs.add(loadbase + addend)
+            elif r_type == R_AARCH64_IRELATIVE:
+                # IFUNC: the addend is a *resolver* function rtld CALLS at
+                # load time; the slot then receives the resolver's return
+                # value, the implementation address it picked for this CPU
+                # (memcpy variants and friends).  Statically the resolver
+                # cannot be run, so pointing the slot at the resolver
+                # itself is the only truthful static value and keeps the
+                # offset/xref chain usable.  Registering the resolver as a
+                # function matters because nothing else finds it: it is
+                # only ever called by rtld through this relocation, so no
+                # in-module BL reaches it and it carries no dynsym symbol.
+                # r_sym is 0 per the ABI (the addend carries everything).
+                idaapi.put_qword(target, loadbase + addend)
+                if f.textoff <= addend < f.textoff + f.textsize:
                     funcs.add(loadbase + addend)
             else:
                 print('TODO r_type %d' % (r_type,))
