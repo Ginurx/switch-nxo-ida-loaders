@@ -653,6 +653,28 @@ class NsoFile(NxoFileBase):
         tfilesize, rfilesize, dfilesize = f.read_from('III', 0x60)
         bsssize = f.read_from('I', 0x3C)
 
+        # [22.0.0+] firmware compresses segments with zstd instead of LZ4
+        # (switchbrew: flags bit 7).  LZ4 would only throw a cryptic error
+        # on those bytes, so route the three segment reads below through
+        # the zstandard module and reject the file with a readable message
+        # when it is missing.  (The indirection is unconditional: binding
+        # the name "uncompress" only inside this if would make it local
+        # to the whole function and crash the plain-LZ4 path.)
+        seg_decompress = uncompress
+        if flags & 0x80:
+            try:
+                import zstandard
+            except ImportError:
+                raise NxoException('zstd-compressed NSO (firmware 22.0.0+) requires the "zstandard" module')
+            _zstd = zstandard.ZstdDecompressor()
+            def _zstd_decompress(data, uncompressed_size):
+                out = _zstd.decompress(data, max_output_size=uncompressed_size)
+                if len(out) != uncompressed_size:
+                    raise NxoException('zstd segment decompressed to %d bytes, expected %d'
+                        % (len(out), uncompressed_size))
+                return out
+            seg_decompress = _zstd_decompress
+
         # .api_info extent at 0x88 (LibHac ApiInfoOffset/Size, switchbrew
         # EmbeddedOffset/Size), relative to .rodata: populated by older
         # SDKs, zeroed on 17.x firmware.
@@ -660,9 +682,9 @@ class NsoFile(NxoFileBase):
         self.api_info = (rloc + api_off, api_size) if api_size else None
 
         print('load text: ')
-        text = (uncompress(f.read_from(tfilesize, toff), uncompressed_size=tsize), None, tloc, tsize) if flags & 1 else (f.read_from(tsize, toff), toff, tloc, tsize)
-        ro   = (uncompress(f.read_from(rfilesize, roff), uncompressed_size=rsize), None, rloc, rsize) if flags & 2 else (f.read_from(rsize, roff), roff, rloc, rsize)
-        data = (uncompress(f.read_from(dfilesize, doff), uncompressed_size=dsize), None, dloc, dsize) if flags & 4 else (f.read_from(dsize, doff), doff, dloc, dsize)
+        text = (seg_decompress(f.read_from(tfilesize, toff), uncompressed_size=tsize), None, tloc, tsize) if flags & 1 else (f.read_from(tsize, toff), toff, tloc, tsize)
+        ro   = (seg_decompress(f.read_from(rfilesize, roff), uncompressed_size=rsize), None, rloc, rsize) if flags & 2 else (f.read_from(rsize, roff), roff, rloc, rsize)
+        data = (seg_decompress(f.read_from(dfilesize, doff), uncompressed_size=dsize), None, dloc, dsize) if flags & 4 else (f.read_from(dsize, doff), doff, dloc, dsize)
 
         # Segment SHA-256 sanity check: flags bits 3/4/5 (one per segment)
         # mark the 32-byte hashes at 0xA0/0xC0/0xE0 as meaningful, and they
