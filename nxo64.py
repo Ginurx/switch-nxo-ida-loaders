@@ -317,6 +317,14 @@ class NxoFileBase(object):
     api_info = None
     api_components = None
 
+    # NRO asset section (ASET) application identity, parsed by NroFile
+    # after super().__init__() from the icon/NACP/romfs blob libnx
+    # homebrew appends past the three segments (see NroFile).  None for
+    # NSO/KIP and for NROs without a usable NACP.
+    asset_title = None
+    asset_author = None
+    asset_version = None
+
     # Pre-dynamic-linking homebrew NROs (libnx before mid-2018, e.g.
     # ChoiDujourNX v1.0.1) carry no ModuleHeader at all: NroStart's +4
     # MOD0-offset field is 0 and the whole rtld layer (.dynamic, .dynsym,
@@ -704,6 +712,49 @@ class NroFile(NxoFileBase):
         self.allow_no_mod0 = True
 
         super(NroFile, self).__init__(text, ro, data, bsssize)
+
+        # libnx homebrew NROs can carry an appended asset section (ASET):
+        # icon + NACP + romfs past the three segments, starting at the
+        # file offset the NRO header's size field (0x18) declares -- the
+        # segments above end exactly there, so the section is pure
+        # metadata and nothing maps it into the IDB (yuzu nro.cpp and
+        # LibHac Nro.cs locate it the same way).  A plain read(4) probes
+        # the magic: a normal NRO ends right at nrosize and reads back
+        # b''; only a broken ASET header (magic present, extents
+        # truncated) downgrades with a note instead of failing the load.
+        nrosize = f.read_from('I', 0x18)
+        f.seek(nrosize)
+        if f.read(4) == b'ASET':
+            try:
+                icon_off, icon_size, nacp_off, nacp_size, romfs_off, romfs_size = \
+                    f.read_from('QQQQQQ', nrosize + 8)
+                print('asset section: icon 0x%x, nacp 0x%x, romfs 0x%x bytes'
+                    % (icon_size, nacp_size, romfs_size))
+                if nacp_size:
+                    # devkitPro's nacptool writes libnx's magic-less NACP
+                    # layout: the 16 language entries start at +0, while
+                    # official control-NCA NACPs carry the "NACP" magic and
+                    # start them at +8.  Entry stride is 0x300 = name[0x200]
+                    # + author[0x100]; DisplayVersion char[0x10] sits at
+                    # +0x3060 in both layouts; homebrew files are only
+                    # 0x4000 long (not the official 0x4200), so bound every
+                    # read.  First non-empty name wins, as in LibHac
+                    # SwitchFs.
+                    nacp = f.read_from(min(nacp_size, 0x4200), nrosize + nacp_off)
+                    base = 8 if nacp[:4] == b'NACP' else 0
+                    for i in range(16):
+                        entry = nacp[base + 0x300*i : base + 0x300*i + 0x300]
+                        name = entry[:0x200].split(b'\x00', 1)[0]
+                        if name:
+                            self.asset_title = name.decode('utf-8', 'replace')
+                            author = entry[0x200:0x300].split(b'\x00', 1)[0]
+                            self.asset_author = author.decode('utf-8', 'replace') or None
+                            break
+                    if len(nacp) >= 0x3070:
+                        version = nacp[0x3060:0x3070].split(b'\x00', 1)[0]
+                        self.asset_version = version.decode('utf-8', 'replace') or None
+            except Exception:
+                print('note: ignoring malformed asset section')
 
 class KipFile(NxoFileBase):
     def __init__(self, fileobj):
@@ -1097,6 +1148,19 @@ else:
             names = [n.rsplit('/', 1)[-1].rsplit('\\', 1)[-1] or n for n in f.needed]
             print('NEEDED: %s' % ', '.join(names))
             idlines.append('NEEDED: %s' % ', '.join(names))
+        if f.asset_title:
+            # NRO asset section (ASET) NACP: the application name hbmenu
+            # shows for this homebrew, its author and the NACP
+            # DisplayVersion (e.g. ChoiDujourNX v1.0.1 -> "NACP:
+            # ChoiDujourNX 1.0.1 by rajkosto"); empty fields drop out.
+            parts = ['NACP: ' + f.asset_title]
+            if f.asset_version:
+                parts.append(f.asset_version)
+            if f.asset_author:
+                parts.append('by ' + f.asset_author)
+            ncpline = ' '.join(parts)
+            print(ncpline)
+            idlines.append(ncpline)
         sdkline = None
         if f.sdk_version:
             sdkline = 'SDK: nnSdk %d.%d.%d' % f.sdk_version
