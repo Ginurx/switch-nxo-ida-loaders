@@ -1132,6 +1132,20 @@ else:
             idc.AutoMark(addr, idc.AU_CODE)
             idc.AutoMark(addr, idc.AU_PROC)
 
+        # Every Switch module image starts with the rtld entry stub at
+        # .text+0 (a B over the module header; KIPs and NROs carry the same
+        # layout -- sm.kip1's [0,0x1c) stub matches the firmware NSOs'), so
+        # register that address as the entry point 'start' in the
+        # Entrypoints window, exactly like IDA's own Python loaders do
+        # (esp.py / wince.py: add_entry alone).  inf_set_start_ea is
+        # deliberately NOT called: assigned during load_file it does not
+        # survive the kernel's post-load reset (start_ea reads back BADADDR
+        # after auto_wait on IDA 9.4).
+        entry = loadbase + f.textoff
+        if not idaapi.is_code(idaapi.get_flags(entry)):
+            idaapi.create_insn(entry)
+        idaapi.add_entry(0, entry, 'start', 1)
+
         # Record module identity where the user will find it: the Output
         # window during load, a comment on the module's first byte and one
         # on its first segment.  For the module id (Build ID): community
